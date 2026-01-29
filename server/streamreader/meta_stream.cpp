@@ -25,6 +25,8 @@
 #include "common/utils/string_utils.hpp"
 
 
+
+#include <algorithm>
 using namespace std;
 
 namespace streamreader
@@ -330,35 +332,35 @@ void MetaStream::setShuffle(bool shuffle, ResultHandler&& handler)
     // Forward to all or master?
     // Current impl forwards to active. Forward to Master.
     for (auto& s : streams_) s->setShuffle(shuffle, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::setLoopStatus(LoopStatus status, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->setLoopStatus(status, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::setVolume(uint16_t volume, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->setVolume(volume, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::setMute(bool mute, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->setMute(mute, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::setRate(float rate, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->setRate(rate, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 
@@ -368,14 +370,14 @@ void MetaStream::setPosition(std::chrono::milliseconds position, ResultHandler&&
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     // ambiguous for meta stream. send to all?
     for (auto& s : streams_) s->setPosition(position, nullptr);
-     handler(snapcast::ErrorCode::kOk);
+     handler(snapcast::ErrorCode());
 }
 
 void MetaStream::seek(std::chrono::milliseconds offset, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->seek(offset, nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::next(ResultHandler&& handler)
@@ -383,21 +385,21 @@ void MetaStream::next(ResultHandler&& handler)
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     // typically next track. Send to master?
      for (auto& s : streams_) s->next(nullptr);
-     handler(snapcast::ErrorCode::kOk);
+     handler(snapcast::ErrorCode());
 }
 
 void MetaStream::previous(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
      for (auto& s : streams_) s->previous(nullptr);
-     handler(snapcast::ErrorCode::kOk);
+     handler(snapcast::ErrorCode());
 }
 
 void MetaStream::pause(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
      for (auto& s : streams_) s->pause(nullptr);
-     handler(snapcast::ErrorCode::kOk);
+     handler(snapcast::ErrorCode());
 }
 
 void MetaStream::playPause(ResultHandler&& handler)
@@ -406,14 +408,14 @@ void MetaStream::playPause(ResultHandler&& handler)
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     // Broadcast
     for (auto& s : streams_) s->playPause(nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::stop(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->stop(nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 void MetaStream::play(ResultHandler&& handler)
@@ -421,7 +423,7 @@ void MetaStream::play(ResultHandler&& handler)
     LOG(DEBUG, LOG_TAG) << "Play\n";
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (auto& s : streams_) s->play(nullptr);
-    handler(snapcast::ErrorCode::kOk);
+    handler(snapcast::ErrorCode());
 }
 
 
