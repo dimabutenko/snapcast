@@ -92,9 +92,6 @@ private:
     std::recursive_mutex active_mutex_;
     // std::shared_ptr<PcmStream> active_stream_;
     // std::unique_ptr<Resampler> resampler_;
-    bool first_read_;
-    std::chrono::time_point<std::chrono::steady_clock> next_tick_;
-
     void mixChunks();
     void checkState();
     double getDuckingVolume(const PcmStream* stream);

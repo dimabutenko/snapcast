@@ -37,7 +37,7 @@ static constexpr double kDuckingVolume = 0.2; // Volume when ducked
 
 MetaStream::MetaStream(PcmStream::Listener* pcmListener, const std::vector<std::shared_ptr<PcmStream>>& streams, boost::asio::io_context& ioc,
                        const ServerSettings& server_settings, const StreamUri& uri, PcmStream::Source source)
-    : PcmStream(pcmListener, ioc, server_settings, uri, source), first_read_(true)
+    : PcmStream(pcmListener, ioc, server_settings, uri, source)
 {
     auto path_components = utils::string::split(uri.path, '/');
     for (const auto& component : path_components)
