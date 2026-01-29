@@ -24,6 +24,8 @@
 #include "pcm_stream.hpp"
 
 // standard headers
+#include <deque>
+#include <map>
 #include <memory>
 
 namespace streamreader
@@ -76,12 +78,26 @@ protected:
     void onResync(const PcmStream* pcmStream, double ms) override;
 
 private:
+    struct StreamState
+    {
+        std::shared_ptr<PcmStream> stream;
+        std::unique_ptr<Resampler> resampler;
+        std::deque<msg::PcmChunk> buffer;
+        double volume = 1.0;
+        bool active = false;
+    };
+
     std::vector<std::shared_ptr<PcmStream>> streams_;
+    std::map<const PcmStream*, std::unique_ptr<StreamState>> stream_states_;
     std::recursive_mutex active_mutex_;
-    std::shared_ptr<PcmStream> active_stream_;
-    std::unique_ptr<Resampler> resampler_;
+    // std::shared_ptr<PcmStream> active_stream_;
+    // std::unique_ptr<Resampler> resampler_;
     bool first_read_;
     std::chrono::time_point<std::chrono::steady_clock> next_tick_;
+
+    void mixChunks();
+    void checkState();
+    double getDuckingVolume(const PcmStream* stream);
 };
 
 } // namespace streamreader

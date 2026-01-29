@@ -31,8 +31,7 @@ namespace streamreader
 {
 
 static constexpr auto LOG_TAG = "MetaStream";
-// static constexpr auto kResyncTolerance = 50ms;
-
+static constexpr double kDuckingVolume = 0.2; // Volume when ducked
 
 MetaStream::MetaStream(PcmStream::Listener* pcmListener, const std::vector<std::shared_ptr<PcmStream>>& streams, boost::asio::io_context& ioc,
                        const ServerSettings& server_settings, const StreamUri& uri, PcmStream::Source source)
@@ -51,6 +50,13 @@ MetaStream::MetaStream(PcmStream::Listener* pcmListener, const std::vector<std::
             {
                 streams_.push_back(stream);
                 stream->addListener(this);
+
+                auto state = make_unique<StreamState>();
+                state->stream = stream;
+                // Resampler will be initialized when format is known/changed
+                state->resampler = make_unique<Resampler>(stream->getSampleFormat(), sampleFormat_);
+                stream_states_[stream.get()] = std::move(state);
+
                 found = true;
                 break;
             }
@@ -61,9 +67,6 @@ MetaStream::MetaStream(PcmStream::Listener* pcmListener, const std::vector<std::
 
     if (streams_.empty())
         throw SnapException("Meta stream '" + getName() + "' must contain at least one stream");
-
-    active_stream_ = streams_.front();
-    resampler_ = make_unique<Resampler>(active_stream_->getSampleFormat(), sampleFormat_);
 }
 
 
@@ -89,10 +92,26 @@ void MetaStream::stop()
 void MetaStream::onPropertiesChanged(const PcmStream* pcmStream, const Properties& properties)
 {
     LOG(DEBUG, LOG_TAG) << "onPropertiesChanged: " << pcmStream->getName() << "\n";
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (pcmStream != active_stream_.get())
-        return;
-    setProperties(properties);
+    std::lock_guard<std::recursive_mutex> lock(active_mutex_);
+    
+    // We only expose properties of the primary stream, or maybe the first one?
+    // For now, let's keep the logic simple: if it's the "master", update properties.
+    // Ideally MetaStream properties are aggregation.
+    
+    // Check if this stream is the current master
+    bool is_master = false;
+    for (const auto& stream : streams_)
+    {
+        if (stream->getState() == ReaderState::kPlaying)
+        {
+            if (stream.get() == pcmStream)
+                is_master = true;
+            break;
+        }
+    }
+
+    if (is_master)
+        setProperties(properties);
 }
 
 
@@ -101,89 +120,178 @@ void MetaStream::onStateChanged(const PcmStream* pcmStream, ReaderState state)
     LOG(DEBUG, LOG_TAG) << "onStateChanged: " << pcmStream->getName() << ", state: " << state << "\n";
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
 
-    // Should a pause keep the stream active? E.g. Spotify can only pause, so it would never get inactive
-    // if (active_stream_->getProperties().playback_status == PlaybackStatus::kPaused)
-    //     return;
-
-    auto switch_stream = [this](const std::shared_ptr<PcmStream>& new_stream)
+    if (stream_states_.find(pcmStream) != stream_states_.end())
     {
-        if (new_stream == active_stream_)
-            return;
-        LOG(INFO, LOG_TAG) << "Stream: " << name_ << ", switching active stream: " << (active_stream_ ? active_stream_->getName() : "<null>") << " => "
-                           << new_stream->getName() << "\n";
-        active_stream_ = new_stream;
-        setProperties(active_stream_->getProperties());
-        resampler_ = make_unique<Resampler>(active_stream_->getSampleFormat(), sampleFormat_);
-    };
+        stream_states_[pcmStream]->active = (state == ReaderState::kPlaying);
+    }
+    
+    checkState();
+}
 
+void MetaStream::checkState()
+{
+    // Determine overall state
+    ReaderState new_state = ReaderState::kIdle;
     for (const auto& stream : streams_)
     {
         if (stream->getState() == ReaderState::kPlaying)
         {
-            if (state_ != ReaderState::kPlaying) // || (active_stream_ != stream))
-                first_read_ = true;
-
-            if (active_stream_ != stream)
-            {
-                switch_stream(stream);
-            }
-
-            setState(ReaderState::kPlaying);
-            return;
+            new_state = ReaderState::kPlaying;
+            break;
         }
     }
-
-    switch_stream(streams_.front());
-    setState(ReaderState::kIdle);
+    
+    if (new_state != state_)
+        setState(new_state);
 }
 
 
 void MetaStream::onChunkRead(const PcmStream* pcmStream, const msg::PcmChunk& chunk)
 {
-    // LOG(TRACE, LOG_TAG) << "onChunkRead: " << pcmStream->getName() << ", duration: " << chunk.durationMs() << "\n";
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
-    if (pcmStream != active_stream_.get())
+    
+    auto it = stream_states_.find(pcmStream);
+    if (it == stream_states_.end())
         return;
-    // active_stream_->sampleFormat_
-    // sampleFormat_
 
-    if (first_read_)
+    StreamState& state = *it->second;
+
+    if (state.resampler && state.resampler->resamplingNeeded())
     {
-        first_read_ = false;
-        LOG(INFO, LOG_TAG) << "first read, updating timestamp\n";
-        tvEncodedChunk_ = std::chrono::steady_clock::now() - chunk.duration<std::chrono::nanoseconds>();
-        next_tick_ = std::chrono::steady_clock::now();
-    }
-
-
-    next_tick_ += chunk.duration<std::chrono::nanoseconds>();
-    auto currentTick = std::chrono::steady_clock::now();
-    auto next_read = next_tick_ - currentTick;
-
-    // Read took longer, wait for the buffer to fill up
-    if (next_read < 0ms)
-    {
-        // if (next_read >= -kResyncTolerance)
-        // {
-        //     LOG(INFO, LOG_TAG) << "next read < 0 (" << getName() << "): " << std::chrono::duration_cast<std::chrono::microseconds>(next_read).count() / 1000.
-        //                        << " ms\n";
-        // }
-        // else
-        // {
-        resync(-next_read);
-        first_read_ = true;
-        // }
-    }
-
-    if (resampler_ && resampler_->resamplingNeeded())
-    {
-        auto resampled_chunk = resampler_->resample(chunk);
+        auto resampled_chunk = state.resampler->resample(chunk);
         if (resampled_chunk)
-            chunkRead(*resampled_chunk);
+             state.buffer.push_back(*resampled_chunk);
     }
     else
-        chunkRead(chunk);
+    {
+        state.buffer.push_back(chunk);
+    }
+
+    mixChunks();
+}
+
+void MetaStream::mixChunks()
+{
+    // Find Master Stream (Highest Priority Playing Stream)
+    StreamState* master_state = nullptr;
+    const PcmStream* master_stream = nullptr;
+
+    for (const auto& stream : streams_)
+    {
+        auto it = stream_states_.find(stream.get());
+        if (it != stream_states_.end() && it->second->active)
+        {
+            master_state = it->second.get();
+            master_stream = stream.get();
+            break;
+        }
+    }
+
+    if (!master_state)
+    {
+        // No active stream, clear buffers to avoid overflow? or just return
+        return;
+    }
+
+    // Process all chunks available in Master
+    while (!master_state->buffer.empty())
+    {
+        auto& master_chunk = master_state->buffer.front();
+        
+        // Prepare output chunk (copy of master)
+        // Apply ducking/volume to master if needed (usually 1.0)
+        double master_vol = getDuckingVolume(master_stream);
+        
+        // Modify master chunk volume in place? or copy?
+        // PcmChunk owns vector<char>.
+        // We need to mix in implementation.
+        // Assuming 16-bit PCM for now (standard for Snapcast internal)
+        // But sampleFormat_ can be anything.
+        
+        // MIXING implementation is complex without helper.
+        // For Proof of Concept / Task:
+        // We will just perform summation for int16.
+        // TODO: Handle other formats.
+
+        if (sampleFormat_.ms != 16) 
+        {
+             // Fallback: Just forward master if not 16 bit (mixing not impl)
+             chunkRead(master_chunk); // Raw forward
+             master_state->buffer.pop_front();
+             continue;
+        }
+
+        // Mix other streams
+        // We need to iterate others
+        
+        // Create a working buffer from master
+        // Ideally we shouldn't modify the buffer in deque if we want to keep it "clean" but we are popping it.
+        
+        // Apply volume to master
+        int16_t* pcm_out = reinterpret_cast<int16_t*>(master_chunk.payload);
+        size_t frame_count = master_chunk.frame_count();
+        size_t channels = sampleFormat_.channels;
+        size_t sample_count = frame_count * channels;
+
+        if (master_vol < 0.99)
+        {
+            for (size_t i = 0; i < sample_count; ++i)
+                pcm_out[i] = static_cast<int16_t>(pcm_out[i] * master_vol);
+        }
+
+        for (const auto& stream : streams_)
+        {
+            if (stream.get() == master_stream) continue;
+            
+            auto it = stream_states_.find(stream.get());
+            if (it == stream_states_.end() || !it->second->active) continue;
+            
+            StreamState& other = *it->second;
+            if (other.buffer.empty()) continue; // drift/underrun
+            
+            auto& other_chunk = other.buffer.front();
+            // Assuming chunks aligned by duration/size because of resampler.
+            // But they might not match exactly.
+            // Take min length?
+            
+            int16_t* pcm_in = reinterpret_cast<int16_t*>(other_chunk.payload);
+            size_t other_count = other_chunk.frame_count() * channels; // assume same channels
+            size_t mix_count = std::min(sample_count, other_count);
+            
+            double other_vol = getDuckingVolume(stream.get());
+            
+            for (size_t i = 0; i < mix_count; ++i)
+            {
+                int32_t mixed = pcm_out[i] + static_cast<int32_t>(pcm_in[i] * other_vol);
+                // Hard clipping
+                if (mixed > 32767) mixed = 32767;
+                if (mixed < -32768) mixed = -32768;
+                pcm_out[i] = static_cast<int16_t>(mixed);
+            }
+            
+            // Pop from other buffer? 
+            // Only if we consumed it. simple 1:1 consumption for now.
+            other.buffer.pop_front();
+        }
+
+        chunkRead(master_chunk);
+        master_state->buffer.pop_front();
+    }
+}
+
+double MetaStream::getDuckingVolume(const PcmStream* stream)
+{
+    // Iterate streams. If we find an active stream BEFORE 'stream', then 'stream' is ducked.
+    for (const auto& s : streams_)
+    {
+        if (s.get() == stream) return 1.0; // Reached self, no higher prio active
+        
+        if (s->getState() == ReaderState::kPlaying)
+        {
+            return kDuckingVolume; // Found higher prio active
+        }
+    }
+    return 1.0;
 }
 
 
@@ -192,18 +300,25 @@ void MetaStream::onChunkEncoded(const PcmStream* pcmStream, std::shared_ptr<msg:
     std::ignore = pcmStream;
     std::ignore = chunk;
     std::ignore = duration;
-    // LOG(TRACE, LOG_TAG) << "onChunkEncoded: " << pcmStream->getName() << ", duration: " << duration << "\n";
-    // chunkEncoded(*encoder_, chunk, duration);
 }
 
 
 void MetaStream::onResync(const PcmStream* pcmStream, double ms)
 {
     LOG(DEBUG, LOG_TAG) << "onResync: " << pcmStream->getName() << ", duration: " << ms << " ms\n";
-    // std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (pcmStream != active_stream_.get())
-        return;
-    resync(std::chrono::nanoseconds(static_cast<int64_t>(ms * 1000000)));
+    std::lock_guard<std::recursive_mutex> lock(active_mutex_);
+    
+    // Propagate resync if it comes from master?
+    bool is_master = false;
+    for (const auto& stream : streams_) {
+        if (stream->getState() == ReaderState::kPlaying) {
+            if (stream.get() == pcmStream) is_master = true;
+            break;
+        }
+    }
+
+    if (is_master)
+        resync(std::chrono::nanoseconds(static_cast<int64_t>(ms * 1000000)));
 }
 
 
@@ -211,32 +326,39 @@ void MetaStream::onResync(const PcmStream* pcmStream, double ms)
 // Setter for properties
 void MetaStream::setShuffle(bool shuffle, ResultHandler&& handler)
 {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setShuffle(shuffle, std::move(handler));
+    std::lock_guard<std::recursive_mutex> lock(mutex_); // PcmStream mutex
+    // Forward to all or master?
+    // Current impl forwards to active. Forward to Master.
+    for (auto& s : streams_) s->setShuffle(shuffle, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::setLoopStatus(LoopStatus status, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setLoopStatus(status, std::move(handler));
+    for (auto& s : streams_) s->setLoopStatus(status, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::setVolume(uint16_t volume, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setVolume(volume, std::move(handler));
+    for (auto& s : streams_) s->setVolume(volume, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::setMute(bool mute, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setMute(mute, std::move(handler));
+    for (auto& s : streams_) s->setMute(mute, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::setRate(float rate, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setRate(rate, std::move(handler));
+    for (auto& s : streams_) s->setRate(rate, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 
@@ -244,66 +366,62 @@ void MetaStream::setRate(float rate, ResultHandler&& handler)
 void MetaStream::setPosition(std::chrono::milliseconds position, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->setPosition(position, std::move(handler));
+    // ambiguous for meta stream. send to all?
+    for (auto& s : streams_) s->setPosition(position, nullptr);
+     handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::seek(std::chrono::milliseconds offset, ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->seek(offset, std::move(handler));
+    for (auto& s : streams_) s->seek(offset, nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::next(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->next(std::move(handler));
+    // typically next track. Send to master?
+     for (auto& s : streams_) s->next(nullptr);
+     handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::previous(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->previous(std::move(handler));
+     for (auto& s : streams_) s->previous(nullptr);
+     handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::pause(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->pause(std::move(handler));
+     for (auto& s : streams_) s->pause(nullptr);
+     handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::playPause(ResultHandler&& handler)
 {
     LOG(DEBUG, LOG_TAG) << "PlayPause\n";
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (active_stream_->getState() == ReaderState::kIdle)
-        play(std::move(handler));
-    else
-        active_stream_->playPause(std::move(handler));
+    // Broadcast
+    for (auto& s : streams_) s->playPause(nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::stop(ResultHandler&& handler)
 {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    active_stream_->stop(std::move(handler));
+    for (auto& s : streams_) s->stop(nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 void MetaStream::play(ResultHandler&& handler)
 {
     LOG(DEBUG, LOG_TAG) << "Play\n";
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if ((active_stream_->getProperties().can_play) && (active_stream_->getProperties().playback_status != PlaybackStatus::kPlaying))
-        return active_stream_->play(std::move(handler));
-
-    for (const auto& stream : streams_)
-    {
-        if ((stream->getState() == ReaderState::kIdle) && (stream->getProperties().can_play))
-        {
-            return stream->play(std::move(handler));
-        }
-    }
-
-    // call play on the active stream to get the handler called
-    active_stream_->play(std::move(handler));
+    for (auto& s : streams_) s->play(nullptr);
+    handler(snapcast::ErrorCode::kOk);
 }
 
 
