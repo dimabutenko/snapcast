@@ -215,7 +215,7 @@ void MetaStream::mixChunks()
         // We will just perform summation for int16.
         // TODO: Handle other formats.
 
-        if (sampleFormat_.ms != 16) 
+        if (sampleFormat_.bits() != 16) 
         {
              // Fallback: Just forward master if not 16 bit (mixing not impl)
              chunkRead(master_chunk); // Raw forward
@@ -231,8 +231,8 @@ void MetaStream::mixChunks()
         
         // Apply volume to master
         int16_t* pcm_out = reinterpret_cast<int16_t*>(master_chunk.payload);
-        size_t frame_count = master_chunk.frame_count();
-        size_t channels = sampleFormat_.channels;
+        size_t frame_count = master_chunk.getFrameCount();
+        size_t channels = sampleFormat_.channels();
         size_t sample_count = frame_count * channels;
 
         if (master_vol < 0.99)
@@ -257,7 +257,7 @@ void MetaStream::mixChunks()
             // Take min length?
             
             int16_t* pcm_in = reinterpret_cast<int16_t*>(other_chunk.payload);
-            size_t other_count = other_chunk.frame_count() * channels; // assume same channels
+            size_t other_count = other_chunk.getFrameCount() * channels; // assume same channels
             size_t mix_count = std::min(sample_count, other_count);
             
             double other_vol = getDuckingVolume(stream.get());
