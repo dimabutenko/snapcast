@@ -82,6 +82,19 @@ void MetaStream::start()
 {
     LOG(DEBUG, LOG_TAG) << "Start, sampleformat: " << sampleFormat_.toString() << "\n";
     PcmStream::start();
+    
+    // Sync initial state
+    std::lock_guard<std::recursive_mutex> lock(active_mutex_);
+    for (const auto& stream : streams_)
+    {
+        if (stream_states_.find(stream.get()) != stream_states_.end())
+        {
+             ReaderState state = stream->getState();
+             stream_states_[stream.get()]->active = (state == ReaderState::kPlaying);
+             LOG(INFO, LOG_TAG) << "Initial state for " << stream->getName() << ": " << state << "\n";
+        }
+    }
+    checkState();
 }
 
 
@@ -119,17 +132,15 @@ void MetaStream::onPropertiesChanged(const PcmStream* pcmStream, const Propertie
 
 void MetaStream::onStateChanged(const PcmStream* pcmStream, ReaderState state)
 {
-    LOG(DEBUG, LOG_TAG) << "onStateChanged: " << pcmStream->getName() << ", state: " << state << "\n";
+    LOG(INFO, LOG_TAG) << "onStateChanged: " << pcmStream->getName() << ", state: " << state << "\n";
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
 
     if (stream_states_.find(pcmStream) != stream_states_.end())
     {
         stream_states_[pcmStream]->active = (state == ReaderState::kPlaying);
+        LOG(INFO, LOG_TAG) << "Set active state for " << pcmStream->getName() << " to " << stream_states_[pcmStream]->active << "\n";
     }
     
-    checkState();
-}
-
 void MetaStream::checkState()
 {
     // Determine overall state
@@ -147,10 +158,10 @@ void MetaStream::checkState()
         setState(new_state);
 }
 
-
 void MetaStream::onChunkRead(const PcmStream* pcmStream, const msg::PcmChunk& chunk)
 {
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
+    // LOG(DEBUG, LOG_TAG) << "onChunkRead from " << pcmStream->getName() << ", frames: " << chunk.getFrameCount() << "\n";
     
     auto it = stream_states_.find(pcmStream);
     if (it == stream_states_.end())
@@ -191,7 +202,7 @@ void MetaStream::mixChunks()
 
     if (!master_state)
     {
-        // No active stream, clear buffers to avoid overflow? or just return
+        // LOG(DEBUG, LOG_TAG) << "No master stream active\n";
         return;
     }
 
@@ -203,12 +214,6 @@ void MetaStream::mixChunks()
         // Prepare output chunk (copy of master)
         // Apply ducking/volume to master if needed (usually 1.0)
         double master_vol = getDuckingVolume(master_stream);
-        
-        // Modify master chunk volume in place? or copy?
-        // PcmChunk owns vector<char>.
-        // We need to mix in implementation.
-        // Assuming 16-bit PCM for now (standard for Snapcast internal)
-        // But sampleFormat_ can be anything.
         
         // MIXING implementation is complex without helper.
         // For Proof of Concept / Task:
@@ -223,12 +228,6 @@ void MetaStream::mixChunks()
              continue;
         }
 
-        // Mix other streams
-        // We need to iterate others
-        
-        // Create a working buffer from master
-        // Ideally we shouldn't modify the buffer in deque if we want to keep it "clean" but we are popping it.
-        
         // Apply volume to master
         int16_t* pcm_out = reinterpret_cast<int16_t*>(master_chunk.payload);
         size_t frame_count = master_chunk.getFrameCount();
