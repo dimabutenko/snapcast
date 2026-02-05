@@ -140,6 +140,7 @@ void MetaStream::onStateChanged(const PcmStream* pcmStream, ReaderState state)
         stream_states_[pcmStream]->active = (state == ReaderState::kPlaying);
         LOG(INFO, LOG_TAG) << "Set active state for " << pcmStream->getName() << " to " << stream_states_[pcmStream]->active << "\n";
     }
+}
     
 void MetaStream::checkState()
 {
