@@ -33,7 +33,7 @@ namespace streamreader
 {
 
 static constexpr auto LOG_TAG = "MetaStream";
-static constexpr double kDuckingVolume = 0.2; // Volume when ducked
+static constexpr double kDuckingVolume = 0.25; // Volume when ducked
 
 MetaStream::MetaStream(PcmStream::Listener* pcmListener, const std::vector<std::shared_ptr<PcmStream>>& streams, boost::asio::io_context& ioc,
                        const ServerSettings& server_settings, const StreamUri& uri, PcmStream::Source source)
@@ -80,7 +80,9 @@ MetaStream::~MetaStream()
 
 void MetaStream::start()
 {
-    LOG(DEBUG, LOG_TAG) << "Start, sampleformat: " << sampleFormat_.toString() << "\n";
+    LOG(INFO, LOG_TAG) << "Start, sampleformat: " << sampleFormat_.toString() << "\n";
+    tvEncodedChunk_ = std::chrono::steady_clock::now();
+    first_ = true;
     PcmStream::start();
     
     // Sync initial state
@@ -135,11 +137,17 @@ void MetaStream::onStateChanged(const PcmStream* pcmStream, ReaderState state)
     LOG(INFO, LOG_TAG) << "onStateChanged: " << pcmStream->getName() << ", state: " << state << "\n";
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
 
-    if (stream_states_.find(pcmStream) != stream_states_.end())
+    auto it = stream_states_.find(pcmStream);
+    if (it != stream_states_.end())
     {
-        stream_states_[pcmStream]->active = (state == ReaderState::kPlaying);
-        LOG(INFO, LOG_TAG) << "Set active state for " << pcmStream->getName() << " to " << stream_states_[pcmStream]->active << "\n";
+        it->second->active = (state == ReaderState::kPlaying);
+        LOG(INFO, LOG_TAG) << "Set active state for " << pcmStream->getName() << " to " << it->second->active << "\n";
     }
+    else
+    {
+        LOG(WARNING, LOG_TAG) << "onStateChanged for unknown stream: " << pcmStream->getName() << "\n";
+    }
+    checkState();
 }
     
 void MetaStream::checkState()
@@ -156,17 +164,24 @@ void MetaStream::checkState()
     }
     
     if (new_state != state_)
+    {
+        if (new_state == ReaderState::kPlaying)
+            first_ = true;
         setState(new_state);
+    }
 }
 
 void MetaStream::onChunkRead(const PcmStream* pcmStream, const msg::PcmChunk& chunk)
 {
     std::lock_guard<std::recursive_mutex> lock(active_mutex_);
-    // LOG(DEBUG, LOG_TAG) << "onChunkRead from " << pcmStream->getName() << ", frames: " << chunk.getFrameCount() << "\n";
+    LOG(INFO, LOG_TAG) << "onChunkRead from " << pcmStream->getName() << ", frames: " << chunk.getFrameCount() << "\n";
     
     auto it = stream_states_.find(pcmStream);
     if (it == stream_states_.end())
+    {
+        LOG(WARNING, LOG_TAG) << "Received chunk from unknown stream: " << pcmStream->getName() << "\n";
         return;
+    }
 
     StreamState& state = *it->second;
 
@@ -186,25 +201,48 @@ void MetaStream::onChunkRead(const PcmStream* pcmStream, const msg::PcmChunk& ch
 
 void MetaStream::mixChunks()
 {
-    // Find Master Stream (Highest Priority Playing Stream)
+    // Synchronization Logic:
+    // To prevent "Double Speed" and buffer bloat, we lock the output rate to a SINGLE "Clock Master".
+    // We choose the LOWEST Priority active stream (last in list, e.g. Music) as the Master.
+    // We ONLY output when this Master has data. High priority streams are mixed in.
+    
     StreamState* master_state = nullptr;
     const PcmStream* master_stream = nullptr;
 
-    for (const auto& stream : streams_)
+    // Iterate in reverse to find lowest priority active stream
+    for (auto it = streams_.rbegin(); it != streams_.rend(); ++it)
     {
-        auto it = stream_states_.find(stream.get());
-        if (it != stream_states_.end() && it->second->active)
+        auto state_it = stream_states_.find(it->get());
+        if (state_it != stream_states_.end() && state_it->second->active)
         {
-            master_state = it->second.get();
-            master_stream = stream.get();
-            break;
+            master_state = state_it->second.get();
+            master_stream = it->get();
+            break; // Found the lowest priority active stream. Stop.
         }
     }
 
     if (!master_state)
     {
-        // LOG(DEBUG, LOG_TAG) << "No master stream active\n";
+        // No active streams.
         return;
+    }
+
+    // Critical Sync Logic:
+    // If the Clock Master has no data, we MUST WAIT.
+    // Do NOT fallback to another stream (that would double-clock).
+    if (master_state->buffer.empty())
+    {
+        return;
+    }
+    
+    if (master_state->buffer.size() > 0)
+    {
+        if (first_)
+        {
+            first_ = false;
+            tvEncodedChunk_ = std::chrono::steady_clock::now();
+            LOG(INFO, LOG_TAG) << "First chunk mixed, resetting timestamp to now\n";
+        }
     }
 
     // Process all chunks available in Master
@@ -212,67 +250,72 @@ void MetaStream::mixChunks()
     {
         auto& master_chunk = master_state->buffer.front();
         
-        // Prepare output chunk (copy of master)
-        // Apply ducking/volume to master if needed (usually 1.0)
-        double master_vol = getDuckingVolume(master_stream);
-        
-        // MIXING implementation is complex without helper.
-        // For Proof of Concept / Task:
-        // We will just perform summation for int16.
-        // TODO: Handle other formats.
-
         if (sampleFormat_.bits() != 16) 
         {
-             // Fallback: Just forward master if not 16 bit (mixing not impl)
-             chunkRead(master_chunk); // Raw forward
+             // Fallback for non-16-bit: Just forward master
+             chunkRead(master_chunk); 
              master_state->buffer.pop_front();
              continue;
         }
 
-        // Apply volume to master
+        // Prepare output chunk
         int16_t* pcm_out = reinterpret_cast<int16_t*>(master_chunk.payload);
         size_t frame_count = master_chunk.getFrameCount();
         size_t channels = sampleFormat_.channels();
         size_t sample_count = frame_count * channels;
 
-        if (master_vol < 0.99)
+        // --- Fading Logic Start ---
+        // Calculate Target Volume for Master (Music)
+        // Check if we should be ducked by any active, non-silent high priority stream
+        double target_vol = getDuckingVolume(master_stream); // Returns 0.5 if needed, 1.0 otherwise
+
+        // Fade Speed: 1.0 seconds to change 0.75 volume (1.0 -> 0.25).
+        // Chunk is 20ms. 1.0s / 0.02s = 50 chunks.
+        // Step = 0.75 / 50 = 0.015.
+        constexpr double kFadeStep = 0.015;
+
+        // Update current volume
+        double& current_vol = master_state->current_volume;
+        if (current_vol > target_vol)
+            current_vol = std::max(target_vol, current_vol - kFadeStep);
+        else if (current_vol < target_vol)
+            current_vol = std::min(target_vol, current_vol + kFadeStep);
+
+        // Apply volume if not full
+        if (current_vol < 0.99)
         {
             for (size_t i = 0; i < sample_count; ++i)
-                pcm_out[i] = static_cast<int16_t>(pcm_out[i] * master_vol);
+                pcm_out[i] = static_cast<int16_t>(pcm_out[i] * current_vol);
         }
+        // --- Fading Logic End ---
 
+        // Mix in other streams
         for (const auto& stream : streams_)
         {
-            if (stream.get() == master_stream) continue;
+            // Skip master
+            if (stream.get() == master_state->stream.get()) continue;
             
             auto it = stream_states_.find(stream.get());
             if (it == stream_states_.end() || !it->second->active) continue;
             
             StreamState& other = *it->second;
-            if (other.buffer.empty()) continue; // drift/underrun
+            if (other.buffer.empty()) continue; 
             
             auto& other_chunk = other.buffer.front();
-            // Assuming chunks aligned by duration/size because of resampler.
-            // But they might not match exactly.
-            // Take min length?
-            
             int16_t* pcm_in = reinterpret_cast<int16_t*>(other_chunk.payload);
             size_t other_count = other_chunk.getFrameCount() * channels; // assume same channels
             size_t mix_count = std::min(sample_count, other_count);
             
-            double other_vol = getDuckingVolume(stream.get());
-            
+            // Full volume mix for others (Notification)
             for (size_t i = 0; i < mix_count; ++i)
             {
-                int32_t mixed = pcm_out[i] + static_cast<int32_t>(pcm_in[i] * other_vol);
-                // Hard clipping
+                int32_t mixed = pcm_out[i] + static_cast<int32_t>(pcm_in[i]); 
                 if (mixed > 32767) mixed = 32767;
                 if (mixed < -32768) mixed = -32768;
                 pcm_out[i] = static_cast<int16_t>(mixed);
             }
             
-            // Pop from other buffer? 
-            // Only if we consumed it. simple 1:1 consumption for now.
+            // Consume from other buffer
             other.buffer.pop_front();
         }
 
@@ -288,9 +331,24 @@ double MetaStream::getDuckingVolume(const PcmStream* stream)
     {
         if (s.get() == stream) return 1.0; // Reached self, no higher prio active
         
-        if (s->getState() == ReaderState::kPlaying)
+        // Only duck if the higher priority stream is Playing AND has buffered data AND is not Silent
+        auto it = stream_states_.find(s.get());
+        if (s->getState() == ReaderState::kPlaying && it != stream_states_.end() && !it->second->buffer.empty())
         {
-            return kDuckingVolume; // Found higher prio active
+             // Check silence
+             const auto& chunk = it->second->buffer.front();
+             bool is_silent = true;
+             const uint64_t* ptr = reinterpret_cast<const uint64_t*>(chunk.payload);
+             size_t len = chunk.payloadSize / 8;
+             for (size_t i = 0; i < len; ++i) {
+                 if (ptr[i] != 0) {
+                     is_silent = false;
+                     break;
+                 }
+             }
+
+             if (!is_silent)
+                return kDuckingVolume; // Found higher prio active WITH data and NOT silent
         }
     }
     return 1.0;

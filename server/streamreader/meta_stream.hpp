@@ -83,18 +83,19 @@ private:
         std::shared_ptr<PcmStream> stream;
         std::unique_ptr<Resampler> resampler;
         std::deque<msg::PcmChunk> buffer;
-        double volume = 1.0;
+        double current_volume = 1.0;
         bool active = false;
     };
 
     std::vector<std::shared_ptr<PcmStream>> streams_;
     std::map<const PcmStream*, std::unique_ptr<StreamState>> stream_states_;
     std::recursive_mutex active_mutex_;
-    // std::shared_ptr<PcmStream> active_stream_;
-    // std::unique_ptr<Resampler> resampler_;
+
     void mixChunks();
     void checkState();
     double getDuckingVolume(const PcmStream* stream);
+
+    bool first_ = true;
 };
 
 } // namespace streamreader
